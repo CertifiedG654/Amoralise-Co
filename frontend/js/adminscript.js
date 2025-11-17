@@ -12,7 +12,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     returnToIndexPage('Cashier.html');
   }  else if (currentUser.role.toLowerCase() === 'customer') {
     returnToIndexPage('Index.html');
-  } else {}
+  } else {
+    document.body.classList.remove('admin-auth-block');
+    document.body.classList.add('admin-auth-ready');
+  }
 
   // === LISTEN FOR NEW ORDERS FROM CUSTOMERS ===
   const orderChannel = new BroadcastChannel('orders');

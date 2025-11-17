@@ -97,6 +97,17 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+body.admin-auth-block .admin-container {
+  opacity: 0;
+  visibility: hidden;
+}
+
+body.admin-auth-ready .admin-container {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity var(--transition-fast);
+}
+
 /* === ADMIN CONTAINER === */
 .admin-container {
   min-height: 100vh;

@@ -150,45 +150,15 @@
       ongoingOrders.push(transformOrder(order, uiStatus, uiStatusLabel, products));
     });
 
-    // Fetch return/refund requests for current user (after orders are categorized)
+    // Return/refund tracking state
     let returnRefundRequests = [];
-    if (currentUser && currentUser.username) {
-      try {
-            // Use username parameter to filter on backend
-            const response = await fetch(window.getApiUrl(`api/return-refund?username=${encodeURIComponent(currentUser.username)}`));
-            if (response.ok) {
-              const data = await response.json();
-              if (data.success && Array.isArray(data.requests)) {
-                // Backend already filtered by username/user_id, so trust it
-                // Only do additional filtering if we have specific concerns
-                returnRefundRequests = data.requests;
-                
-                // Optional: Log if any requests don't match user's orders (for debugging)
-                if (userOrderIds.size > 0) {
-                  const unmatched = returnRefundRequests.filter(r => !userOrderIds.has(r.order_id));
-                  if (unmatched.length > 0) {
-                    console.warn('⚠️ Some return/refund requests have order IDs not in user orders:', unmatched);
-                  }
-                }
-                
-                console.log(`✅ Found ${returnRefundRequests.length} return/refund requests for user ${currentUser.username}`, {
-                  totalRequests: data.requests.length,
-                  userOrderIds: Array.from(userOrderIds),
-                  filteredRequests: returnRefundRequests,
-                  requests: returnRefundRequests
-                });
-              } else {
-                console.warn('⚠️ Backend returned invalid data:', data);
-                returnRefundRequests = [];
-              }
-            } else {
-              console.error('❌ Failed to fetch return/refund requests:', response.status, response.statusText);
-              returnRefundRequests = [];
-            }
-      } catch (err) {
-        console.error('Error fetching return/refund requests:', err);
-      }
-    }
+    const RETURN_ONLY_STATUSES = new Set(['Approved', 'Returned', 'Refunded']);
+    const RETURN_REFUND_AUTO_REFRESH_MS = 15000;
+    let returnRefundRefreshTimer = null;
+    let returnRefundAutoRefreshListenersBound = false;
+    const returnRefundChannel = (typeof BroadcastChannel !== 'undefined')
+      ? new BroadcastChannel('return-refund-updates')
+      : null;
 
     // Format date helper function (accessible to all rendering functions)
     const formatDate = (dateString) => {
@@ -263,7 +233,7 @@
     const ordersLists = document.querySelectorAll('.orders-list');
 
     tabButtons.forEach(button => {
-      button.addEventListener('click', () => {
+      button.addEventListener('click', async () => {
         const targetTab = button.getAttribute('data-tab');
 
         // Update active tab
@@ -290,54 +260,7 @@
         } else if (targetTab === 'completed') {
           renderOrders(completedOrders, 'completed-orders-list', 'completed-empty');
         } else if (targetTab === 'return-refund') {
-          console.log('🔄 Tab clicked: return-refund, calling renderReturnRefundRequests');
-          console.log('📊 Current returnRefundRequests:', returnRefundRequests);
-          // Re-fetch if array is empty or undefined
-          if (!returnRefundRequests || returnRefundRequests.length === 0) {
-            console.log('⚠️ returnRefundRequests is empty, re-fetching...');
-            // Re-fetch return/refund requests
-            if (currentUser && currentUser.username) {
-              fetch(window.getApiUrl(`api/return-refund?username=${encodeURIComponent(currentUser.username)}`))
-                .then(response => {
-                  if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                  }
-                  return response.json();
-                })
-                .then(data => {
-                  if (data.success && Array.isArray(data.requests)) {
-                    // Trust backend filtering
-                    returnRefundRequests = data.requests;
-                    console.log('✅ Re-fetched return/refund requests:', returnRefundRequests.length, returnRefundRequests);
-                    renderReturnRefundRequests().catch(err => {
-                      console.error('❌ Error rendering return/refund requests:', err);
-                    });
-                  } else {
-                    console.warn('⚠️ Backend returned invalid data on re-fetch:', data);
-                    returnRefundRequests = [];
-                    renderReturnRefundRequests().catch(err => {
-                      console.error('❌ Error rendering return/refund requests:', err);
-                    });
-                  }
-                })
-                .catch(err => {
-                  console.error('❌ Error re-fetching return/refund requests:', err);
-                  returnRefundRequests = [];
-                  renderReturnRefundRequests().catch(err => {
-                    console.error('❌ Error rendering return/refund requests:', err);
-                  });
-                });
-            } else {
-              console.warn('⚠️ No current user, cannot re-fetch');
-              renderReturnRefundRequests().catch(err => {
-                console.error('❌ Error rendering return/refund requests:', err);
-              });
-            }
-          } else {
-            renderReturnRefundRequests().catch(err => {
-              console.error('❌ Error rendering return/refund requests:', err);
-            });
-          }
+          await refreshReturnRefundData({ forceRender: true, reason: 'tab-click' });
         }
       });
     });
@@ -349,10 +272,12 @@
 
       if (!ordersList || !emptyState) return;
 
+      const visibleOrders = getVisibleOrdersForTab(orders);
+
       // Clear existing content
       ordersList.innerHTML = '';
 
-      if (orders.length === 0) {
+      if (visibleOrders.length === 0) {
         ordersList.style.display = 'none';
         emptyState.style.display = 'block';
         return;
@@ -362,7 +287,7 @@
       emptyState.style.display = 'none';
 
       // Render each order
-      orders.forEach(order => {
+      visibleOrders.forEach(order => {
         const orderCard = createOrderCard(order);
         ordersList.appendChild(orderCard);
       });
@@ -479,22 +404,51 @@
       const completedCount = document.getElementById('completed-count');
       const returnRefundCount = document.getElementById('return-refund-count');
 
+      const hiddenOrderIds = getReturnTabOrderIds();
+
       if (ongoingCount) {
-        ongoingCount.textContent = ongoingOrders.length;
+        ongoingCount.textContent = hiddenOrderIds.size
+          ? getVisibleOrdersForTab(ongoingOrders, hiddenOrderIds).length
+          : ongoingOrders.length;
       }
       if (completedCount) {
-        completedCount.textContent = completedOrders.length;
+        completedCount.textContent = hiddenOrderIds.size
+          ? getVisibleOrdersForTab(completedOrders, hiddenOrderIds).length
+          : completedOrders.length;
       }
       if (returnRefundCount) {
         returnRefundCount.textContent = returnRefundRequests.length;
       }
     }
 
+    function getReturnTabOrderIds() {
+      const ids = new Set();
+      if (Array.isArray(returnRefundRequests) && returnRefundRequests.length > 0) {
+        returnRefundRequests.forEach(request => {
+          if (request && request.order_id && RETURN_ONLY_STATUSES.has(request.status)) {
+            ids.add(String(request.order_id));
+          }
+        });
+      }
+      return ids;
+    }
+
+    function getVisibleOrdersForTab(orders, reservedIds = getReturnTabOrderIds()) {
+      if (!Array.isArray(orders) || !reservedIds || reservedIds.size === 0) {
+        return Array.isArray(orders) ? orders : [];
+      }
+      return orders.filter(order => !reservedIds.has(String(order.orderId)));
+    }
+
+    function isReturnTabActive() {
+      const activeTabBtn = document.querySelector('.tab-btn.active');
+      return activeTabBtn?.getAttribute('data-tab') === 'return-refund';
+    }
+
     // Render return/refund requests
     async function renderReturnRefundRequests() {
       const container = document.getElementById('return-refund-orders-list');
       const emptyState = document.getElementById('return-refund-empty');
-      const parentSection = document.getElementById('return-refund-orders');
 
       if (!container) {
         console.error('❌ Return/refund container not found!');
@@ -504,15 +458,8 @@
       console.log('🔄 Rendering return/refund requests:', {
         count: returnRefundRequests.length,
         requests: returnRefundRequests,
-        container: container,
-        parentSection: parentSection
+        container: container
       });
-
-      // Ensure parent section is visible
-      if (parentSection) {
-        parentSection.style.display = 'block';
-        parentSection.classList.add('active');
-      }
 
       container.innerHTML = '';
 
@@ -592,6 +539,114 @@
       }
     }
 
+    async function fetchReturnRefundRequestsForUser(username) {
+      if (!username) return [];
+      try {
+        const response = await fetch(window.getApiUrl(`api/return-refund?username=${encodeURIComponent(username)}`));
+        if (!response.ok) {
+          console.error('❌ Failed to fetch return/refund requests:', response.status, response.statusText);
+          return null;
+        }
+        const data = await response.json();
+        if (data.success && Array.isArray(data.requests)) {
+          return data.requests;
+        }
+        console.warn('⚠️ Unexpected return/refund payload:', data);
+        return null;
+      } catch (err) {
+        console.error('❌ Error fetching return/refund requests:', err);
+        return null;
+      }
+    }
+
+    function buildRequestSignature(requests = []) {
+      return (Array.isArray(requests) ? requests : [])
+        .map(req => `${req?.id ?? '0'}|${req?.status ?? 'Pending'}|${req?.updated_at ?? ''}`)
+        .sort()
+        .join('::');
+    }
+
+    function haveRequestsChanged(prev = [], next = []) {
+      if (!Array.isArray(prev)) prev = [];
+      if (!Array.isArray(next)) next = [];
+
+      if (prev.length !== next.length) {
+        return true;
+      }
+
+      return buildRequestSignature(prev) !== buildRequestSignature(next);
+    }
+
+    function stopReturnRefundAutoRefresh() {
+      if (returnRefundRefreshTimer) {
+        clearInterval(returnRefundRefreshTimer);
+        returnRefundRefreshTimer = null;
+      }
+    }
+
+    function startReturnRefundAutoRefresh() {
+      if (returnRefundRefreshTimer || !currentUser || !currentUser.username) return;
+      returnRefundRefreshTimer = setInterval(() => {
+        refreshReturnRefundData({ reason: 'interval' }).catch(err => {
+          console.debug('Return/refund auto-refresh skipped:', err?.message || err);
+        });
+      }, RETURN_REFUND_AUTO_REFRESH_MS);
+    }
+
+    function ensureReturnRefundAutoRefresh() {
+      if (!returnRefundAutoRefreshListenersBound) {
+        document.addEventListener('visibilitychange', () => {
+          if (document.hidden) {
+            stopReturnRefundAutoRefresh();
+          } else if (currentUser && currentUser.username) {
+            refreshReturnRefundData({ reason: 'visibility' })
+              .finally(() => startReturnRefundAutoRefresh());
+          }
+        });
+
+        window.addEventListener('beforeunload', () => {
+          stopReturnRefundAutoRefresh();
+        });
+
+        returnRefundAutoRefreshListenersBound = true;
+      }
+
+      startReturnRefundAutoRefresh();
+    }
+
+    async function refreshReturnRefundData({ forceRender = false, reason = 'manual' } = {}) {
+      if (!currentUser || !currentUser.username) return;
+
+      const latestRequests = await fetchReturnRefundRequestsForUser(currentUser.username);
+      if (latestRequests === null) {
+        return;
+      }
+
+      const changed = haveRequestsChanged(returnRefundRequests, latestRequests);
+      const shouldRenderTab = forceRender || isReturnTabActive();
+
+      if (!changed && !forceRender) {
+        if (shouldRenderTab) {
+          await renderReturnRefundRequests();
+        }
+        return;
+      }
+
+      returnRefundRequests = latestRequests;
+
+      // Refresh order lists so orders move between tabs correctly
+      renderOrders(ongoingOrders, 'ongoing-orders-list', 'ongoing-empty');
+      renderOrders(completedOrders, 'completed-orders-list', 'completed-empty');
+
+      updateTabCounts();
+
+      if (shouldRenderTab || forceRender) {
+        await renderReturnRefundRequests();
+      }
+
+      console.log(`🔁 Return/refund data refreshed (${reason}). Total requests: ${returnRefundRequests.length}`);
+    }
+
     // Create return/refund request card
     function createReturnRefundCard(request, order, products) {
       const card = document.createElement('div');
@@ -600,7 +655,9 @@
       // Get order items if available
       let itemsHTML = '';
       if (order && order.items && Array.isArray(order.items)) {
-        itemsHTML = order.items.map(item => `
+        itemsHTML = order.items.map(item => {
+          const normalizedPrice = normalizePrice(item.price ?? item.total ?? 0);
+          return `
           <div class="order-item">
             <div class="item-image">
               ${getProductImage(item.product_id || item.id, products)}
@@ -608,10 +665,11 @@
             <div class="item-details">
               <div class="item-name">${escapeHtml(item.name || item.product_name || 'Unknown Product')}</div>
               <div class="item-quantity">Quantity: ${item.quantity || item.qty || 0}</div>
-              <div class="item-price">₱${(item.price || 0).toFixed(2)}</div>
+              <div class="item-price">₱${normalizedPrice.toFixed(2)}</div>
             </div>
           </div>
-        `).join('');
+        `;
+        }).join('');
       } else {
         itemsHTML = '<div class="text-muted">Order details not available</div>';
       }
@@ -676,7 +734,7 @@
           </div>
           <div class="order-total">
             <span class="total-label">Amount:</span>
-            <span class="total-amount">₱${Number(request.total_amount || 0).toFixed(2)}</span>
+            <span class="total-amount">₱${normalizePrice(request.total_amount).toFixed(2)}</span>
           </div>
         </div>
         <div class="return-refund-details" style="padding: 15px; background: #f8f9fa; border-top: 1px solid #dee2e6;">
@@ -695,6 +753,13 @@
       `;
 
       return card;
+    }
+
+    function normalizePrice(value) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+      const fallback = Number.parseFloat(value);
+      return Number.isFinite(fallback) ? fallback : 0;
     }
 
     function getProductImage(productId, products) {
@@ -1180,10 +1245,9 @@
     // Initialize: Load ongoing orders by default
     renderOrders(ongoingOrders, 'ongoing-orders-list', 'ongoing-empty');
     updateTabCounts();
-    
-    // Don't pre-render return/refund requests on initial load
-    // They will render when the Return/Refund tab is clicked
-    // renderReturnRefundRequests();
+
+    await refreshReturnRefundData({ reason: 'initial-load' });
+    ensureReturnRefundAutoRefresh();
 
     // Add logout button handler
     const logoutBtn = document.getElementById('logout-btn');
@@ -1228,5 +1292,15 @@
         }, 1000);
       }
     };
+
+    if (returnRefundChannel) {
+      returnRefundChannel.onmessage = (event) => {
+        const { action } = event.data || {};
+        if (action === 'status-updated' || action === 'request-created') {
+          refreshReturnRefundData({ reason: 'broadcast', forceRender: action === 'status-updated' && isReturnTabActive() })
+            .catch(err => console.debug('Return/refund broadcast refresh skipped:', err?.message || err));
+        }
+      };
+    }
   });
 })();

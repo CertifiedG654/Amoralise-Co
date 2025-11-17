@@ -119,7 +119,9 @@ CREATE TABLE return_refund_requests (
     request_type TEXT NOT NULL DEFAULT 'Return',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    admin_notes TEXT
+    admin_notes TEXT,
+    restock_processed BOOLEAN NOT NULL DEFAULT FALSE,
+    restocked_at TIMESTAMPTZ
 );
 
 -- Create indexes for better performance

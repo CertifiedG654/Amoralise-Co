@@ -194,21 +194,34 @@ function openBrowse() {
 }
 
 
+    function dedupeProducts(list = []) {
+      const map = new Map();
+      list.forEach(item => {
+        if (!item || item.id == null) return;
+        const rawKey = String(item.id).trim();
+        if (!rawKey) return;
+        const key = rawKey;
+        if (!map.has(key)) {
+          map.set(key, {
+            ...item,
+            id: typeof item.id === 'number' ? item.id : (Number(rawKey) || rawKey)
+          });
+        } else {
+          const existing = map.get(key);
+          map.set(key, {
+            ...existing,
+            ...item,
+            stock: Number(item.stock ?? existing.stock ?? 0)
+          });
+        }
+      });
+      return Array.from(map.values());
+    }
+
     // Load products from localStorage (dedupe by id)
     function loadProductsFromStorage() {
       const stored = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
-      const unique = [];
-      const seen = new Set();
-      for (const p of stored) {
-        if (!p || (p.id == null)) continue;
-        const key = String(p.id);
-        if (!seen.has(key)) {
-          seen.add(key);
-          unique.push(p);
-        }
-      }
-      products = unique;
-      // persist the deduped list
+      products = dedupeProducts(stored);
       localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
       return products;
     }
@@ -324,6 +337,12 @@ function openBrowse() {
           const apiIds = new Set(apiData.map(x => String(x.id)));
           const localOnly = (Array.isArray(products) ? products : []).filter(p => p && p.id != null && !apiIds.has(String(p.id)));
           if (localOnly.length) source = source.concat(localOnly);
+
+          // Final safeguard: dedupe merged source. When focus/visibility triggers overlap,
+          // the same product can arrive via API and local cache simultaneously,
+          // which would otherwise render duplicates.
+          source = dedupeProducts(source);
+
           // update global products with merged source so future operations use this merged state
           products = source.slice();
           // persist merged
@@ -334,9 +353,13 @@ function openBrowse() {
             productList.innerHTML = '<p>No products available.</p>';
             return;
           }
-          source = arr;
+          source = dedupeProducts(arr);
         }
       }
+
+      // Final safeguard before rendering
+      source = dedupeProducts(source);
+      products = dedupeProducts(products);
 
       // Calculate available stock by subtracting cart quantities
       // This ensures we don't allow adding more items than available

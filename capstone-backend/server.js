@@ -275,6 +275,8 @@ const otpStore = {};
       created_at DATETIME DEFAULT (datetime('now', 'localtime')),
       updated_at DATETIME DEFAULT (datetime('now', 'localtime')),
       admin_notes TEXT,
+      restock_processed INTEGER NOT NULL DEFAULT 0 CHECK (restock_processed IN (0, 1)),
+      restocked_at DATETIME,
       FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
     );
@@ -371,6 +373,26 @@ const otpStore = {};
           console.debug('Index creation note:', idxErr.message);
         }
       }
+    }
+
+    // Ensure return/refund table has restock tracking columns
+    try {
+      const returnRefundInfo = await db.all(`PRAGMA table_info(return_refund_requests)`);
+      const hasRestockProcessed = returnRefundInfo.some(col => col.name === 'restock_processed');
+      if (!hasRestockProcessed) {
+        console.log('🔄 Adding restock_processed column to return_refund_requests...');
+        await db.run(`ALTER TABLE return_refund_requests ADD COLUMN restock_processed INTEGER NOT NULL DEFAULT 0`);
+        console.log('✅ Added restock_processed column');
+      }
+
+      const hasRestockedAt = returnRefundInfo.some(col => col.name === 'restocked_at');
+      if (!hasRestockedAt) {
+        console.log('🔄 Adding restocked_at column to return_refund_requests...');
+        await db.run(`ALTER TABLE return_refund_requests ADD COLUMN restocked_at DATETIME`);
+        console.log('✅ Added restocked_at column');
+      }
+    } catch (rrMigrationErr) {
+      console.warn('⚠️ Could not migrate return_refund_requests table:', rrMigrationErr.message);
     }
   } catch (err) {
     console.error('⚠️ Migration error:', err.message);
@@ -1682,23 +1704,59 @@ app.put("/api/return-refund/:id/status", async (req, res) => {
       return res.status(404).json({ success: false, message: "Return/Refund request not found" });
     }
 
-    // Update request status
+    const requestType = (request.request_type || 'Return').toLowerCase();
+    const shouldRestock = requestType === 'return' && (status === 'Approved' || status === 'Returned');
+    let restockProcessed = Number(request.restock_processed) === 1;
+    let stockRestored = false;
+
+    if (shouldRestock && !restockProcessed) {
+      try {
+        await restoreOrderStock(request.order_id);
+        restockProcessed = true;
+        stockRestored = true;
+      } catch (restockErr) {
+        console.error('Error restoring stock for return/refund request:', restockErr);
+        return res.status(500).json({ 
+          success: false, 
+          message: "Failed to restore stock for returned items", 
+          error: restockErr.message 
+        });
+      }
+    }
+
+    // Update request status (and restock metadata if applicable)
     await db.run(
       `UPDATE return_refund_requests 
-       SET status = ?, admin_notes = ?, updated_at = datetime('now', 'localtime')
+       SET status = ?, 
+           admin_notes = ?, 
+           updated_at = datetime('now', 'localtime'),
+           restock_processed = ?,
+           restocked_at = CASE 
+             WHEN ? = 1 THEN COALESCE(restocked_at, datetime('now', 'localtime'))
+             ELSE restocked_at
+           END
        WHERE id = ?`,
-      [status, admin_notes || null, id]
+      [status, admin_notes || null, restockProcessed ? 1 : 0, restockProcessed ? 1 : 0, id]
     );
 
-    // If status is "Returned", update order status if needed
+    // Update order status if needed
     if (status === 'Returned') {
       await db.run(
         `UPDATE orders SET order_status = 'Returned', updated_at = datetime('now', 'localtime') WHERE order_id = ?`,
         [request.order_id]
       );
+    } else if (status === 'Refunded') {
+      await db.run(
+        `UPDATE orders SET order_status = 'Refunded', updated_at = datetime('now', 'localtime') WHERE order_id = ?`,
+        [request.order_id]
+      );
     }
 
-    res.json({ success: true, message: `Return/Refund request status updated to ${status}` });
+    res.json({ 
+      success: true, 
+      message: `Return/Refund request status updated to ${status}`,
+      stockRestored
+    });
   } catch (error) {
     console.error('Error updating return/refund request status:', error);
     res.status(500).json({ success: false, message: "Failed to update return/refund request status", error: error.message });

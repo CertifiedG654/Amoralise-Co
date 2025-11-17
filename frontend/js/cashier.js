@@ -99,8 +99,11 @@ async function initializeCashier() {
   const emptyMessage = document.getElementById('empty-message');
   const refreshBtn = document.getElementById('refreshBtn');
 
-  // Single broadcast channel used where needed
+  // Broadcast channels for cross-tab updates
   const productUpdateChannel = new BroadcastChannel('product-updates');
+  const returnRefundChannel = (typeof BroadcastChannel !== 'undefined')
+    ? new BroadcastChannel('return-refund-updates')
+    : null;
 
   // ======== Tab Management ========
   function setupTabs() {
@@ -493,6 +496,14 @@ async function initializeCashier() {
       // Also refresh tab counts
       const allOrders = await getOrdersAPI() || [];
       await updateTabCounts(allOrders);
+
+      // Notify other tabs (e.g., customers) to refresh return/refund data
+      returnRefundChannel?.postMessage({
+        action: 'status-updated',
+        requestId,
+        status: newStatus,
+        timestamp: Date.now()
+      });
     } catch (error) {
       console.error('Error updating return/refund status:', error);
       Swal.fire({
