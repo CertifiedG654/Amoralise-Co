@@ -106,34 +106,53 @@ const otpStore = {};
       return sql.replace(/\?/g, () => `$${++index}`);
     };
 
+    const convertSQLiteFunctions = (sql) => {
+      // Convert SQLite datetime functions to PostgreSQL
+      sql = sql.replace(/datetime\s*\(\s*'now'\s*,\s*'localtime'\s*\)/gi, 'CURRENT_TIMESTAMP');
+      sql = sql.replace(/datetime\s*\(\s*'now'\s*\)/gi, 'CURRENT_TIMESTAMP');
+      sql = sql.replace(/date\s*\(\s*'now'\s*\)/gi, 'CURRENT_DATE');
+      return sql;
+    };
+
     db = {
       run: async (sql, params = []) => {
         let pgSql = convertPlaceholders(sql);
+        pgSql = convertSQLiteFunctions(pgSql);
         
         // Add RETURNING id for INSERT statements if not already present
-        if (pgSql.trim().toUpperCase().startsWith('INSERT') && 
-            !pgSql.toUpperCase().includes('RETURNING')) {
+        // But skip tables that don't have an 'id' column
+        const tablesWithoutId = ['orders', 'order_items']; // orders uses order_id (TEXT), order_items uses order_item_id (SERIAL)
+        const isInsert = pgSql.trim().toUpperCase().startsWith('INSERT');
+        const hasReturning = pgSql.toUpperCase().includes('RETURNING');
+        const isTableWithoutId = tablesWithoutId.some(table => 
+          pgSql.toUpperCase().includes(`INSERT INTO ${table.toUpperCase()}`)
+        );
+        
+        if (isInsert && !hasReturning && !isTableWithoutId) {
           pgSql += ' RETURNING id';
         }
         
         const result = await pool.query(pgSql, params);
         return { 
-          lastID: result.rows[0]?.id || null,
+          lastID: result.rows[0]?.id || result.rows[0]?.order_id || null,
           changes: result.rowCount 
         };
       },
       get: async (sql, params = []) => {
-        const pgSql = convertPlaceholders(sql);
+        let pgSql = convertPlaceholders(sql);
+        pgSql = convertSQLiteFunctions(pgSql);
         const result = await pool.query(pgSql, params);
         return result.rows[0] || null;
       },
       all: async (sql, params = []) => {
-        const pgSql = convertPlaceholders(sql);
+        let pgSql = convertPlaceholders(sql);
+        pgSql = convertSQLiteFunctions(pgSql);
         const result = await pool.query(pgSql, params);
         return result.rows;
       },
       exec: async (sql) => {
-        await pool.query(sql);
+        let pgSql = convertSQLiteFunctions(sql);
+        await pool.query(pgSql);
       }
     };
 
@@ -925,14 +944,15 @@ app.post("/api/sales", async (req, res) => {
     );
 
     // Insert into salesorder for backward compatibility
-    items.forEach(item => {
-      db.run('INSERT INTO salesorder (name, price, qty, salesid) values (?, ?, ?, ?)', [
+    const salesId = sales.lastID;
+    for (const item of items) {
+      await db.run('INSERT INTO salesorder (name, price, qty, salesid) values (?, ?, ?, ?)', [
         item.name || item.names,
         item.price, 
         item.qty || item.quantity,
-        sales.lastID
+        salesId
       ]);
-    });
+    }
 
     res.json({ 
       success: true, 
